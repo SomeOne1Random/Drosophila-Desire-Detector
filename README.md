@@ -31,7 +31,7 @@ This project aims to analyze the behavior of flies in a video. It specifically f
 First, clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/fly-behavior-analysis.git
+git clone https://github.com/SomeOne1Random/drosophila-melanogaster-mating-time-finder-python
 ```
 
 Then navigate to the project directory and install the required packages:
