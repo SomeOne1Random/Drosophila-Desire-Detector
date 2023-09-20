@@ -1,526 +1,506 @@
+import sys
+from PyQt6.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QLineEdit
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap, QImage
 import cv2
 import numpy as np
-import time
 import pandas as pd
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog, QHBoxLayout, \
-    QScrollArea, QListWidget, QDialog, QMessageBox
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QFontMetrics, QIcon
-from PyQt5.QtCore import QThread, Qt, pyqtSignal, pyqtSlot
 
-class BlobData:
-    def __init__(self):
-        self.blob_positions = []
-        self.fly_ids = {}
+class VideoProcessingThread(QThread):
+    finished = pyqtSignal()
+    frame_processed = pyqtSignal(np.ndarray, dict)
+    frame_info = pyqtSignal(int, float)
+    verified_mating_start_times = pyqtSignal(dict)
+    fly_info = pyqtSignal(int, object)
+    binary_image_processed = pyqtSignal(np.ndarray)
 
-    def assign_fly_id(self, blob_id, fly_id):
-        self.fly_ids[blob_id] = fly_id
-
-
-class FlyData:
-    def __init__(self, fly_id, centroid):
-        self.fly_id = fly_id
-        self.centroid = centroid
-        self.mating = False
-        self.mating_start_time = None
-
-    def update_position(self, centroid):
-        self.centroid = centroid
-
-
-class MatingData:
-    def __init__(self, fly1_id, fly2_id, mating_start_time):
-        self.fly1_id = fly1_id
-        self.fly2_id = fly2_id
-        self.mating_start_time = mating_start_time
-
-
-class VideoThread(QThread):
-    change_pixmap_signal = pyqtSignal(QImage)
-    change_text_signal = pyqtSignal(int, str)
-    change_elapsed_time_signal = pyqtSignal(str)
-
-    def __init__(self):
+    def __init__(self, video_path, initial_contours, fps):
         super().__init__()
-        self._run_flag = True
-        self.filename = None
-        self.start_time = None
-        self.rois = None
-        self.roi_flies_mating_start_time = None
-        self.roi_flies_last_mate_time = None
-        self.roi_flies_verified_mating = None
-        self.blob_data = []
-        self.fly_data = []
-        self.centroid_position_dialog = None
-        self.roi_number = None
+        self.video_path = video_path
+        self.initial_contours = initial_contours
+        self.is_running = False
+        self.roi_ids = {}  # Dictionary to store ROI IDs
+        self.mating_start_times = {}  # Dictionary to store mating start times for each ROI
+        self.mating_durations = {}  # Dictionary to store mating durations for each ROI
+        self.fps = fps
+        self.mating_start_frames = {}  # Dictionary to store mating start frames for each ROI
+        self.mating_grace_frames = {}  # Dictionary to store grace frames for each ROI
+        self.mating_start_times_df = pd.DataFrame(columns=['ROI', 'Start Times'])  # Create an empty DataFrame to store mating start times
+        self.sex_ids = {}  # Dictionary to store sex IDs for each ROI
+        self.female_fly_positions = {}  # Dictionary to store positions for each ROI
+        self.last_known_positions = {}  # Dictionary to store last known positions for flies in each ROI
+        self.female_trail_data = {}  # Dictionary to store trail data for female flies
+        self.previous_positions = {}  # Dictionary to store last known positions for flies in each ROI
+        self.consecutive_size_diff_count = {}
+
+    def export_combined_mating_times(self):
+        combined_mating_times = {}
+        for roi_id, mating_time in self.mating_start_times.items():
+            # Check if this mating time is within 1 second of another mating time
+            is_combined = False
+            for combined_id, combined_time in combined_mating_times.items():
+                if abs(mating_time - combined_time) <= 1:
+                    combined_mating_times[combined_id] = (combined_time + mating_time) / 2
+                    is_combined = True
+                    break
+            if not is_combined:
+                combined_mating_times[roi_id] = mating_time
+
+        # Create a DataFrame from the combined mating times
+        combined_mating_df = pd.DataFrame(list(combined_mating_times.items()), columns=['ROI', 'Start Time'])
+        combined_mating_df['Mating Duration'] = [self.mating_durations.get(roi_id, 0) for roi_id in
+                                                 combined_mating_df['ROI']]
+        return combined_mating_df
 
     def run(self):
+        self.is_running = True
+
+        cap = cv2.VideoCapture(self.video_path)
+        frame_count = 0
         current_frame = 0
-        if not self.filename:
-            return
+        while self.is_running:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            self.process_frame(frame, self.initial_contours, current_frame)  # or any other value for frame_count
+            self.frame_info.emit(current_frame, current_frame / self.fps)
+            current_frame += 1
 
-        cap = cv2.VideoCapture(self.filename)
-        if not cap.isOpened():
-            print("Could not open video.")
-            return
+            # Process the frame here
+            processed_frame, masks = self.process_frame(frame, self.initial_contours, frame_count)
+            self.detect_flies(processed_frame, masks, frame_count)
+            self.frame_processed.emit(processed_frame, self.mating_durations)
 
-        min_roi_size = 30
-        ret, first_frame = cap.read()
-        if not ret:
-            print("Cannot read video file.")
-            return
+            frame_count += 1
 
-        self.rois = self.define_roi(first_frame, min_roi_size)
-        self.initialize_roi_data()
+        cap.release()
+        self.finished.emit()
 
+    def stop(self):
+        self.is_running = False
+
+    def process_frame(self, frame, initial_contours, frame_count):
+        # Convert frame to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Threshold the image to obtain a binary image
+        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+
+        # Find contours of white regions
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Convert contours to a list and sort based on x-coordinate of their bounding rectangles
+        contours_list = list(contours)
+        contours_list.sort(key=lambda ctr: cv2.boundingRect(ctr)[0])
+
+        # Emit the binary image
+        self.binary_image_processed.emit(thresh)
+
+        # Store initial contours if frame_count <= 100
+        if frame_count <= 100:
+            initial_contours.clear()
+            self.roi_ids.clear()  # Clear ROI IDs
+            for i, contour in enumerate(contours_list):
+                area = cv2.contourArea(contour)
+                if area > 100:  # Minimum area threshold to filter out noise
+                    initial_contours.append({"contour": contour, "edge_duration": 0})
+                    contour_id = self.generate_contour_id(contour)
+                    self.roi_ids[contour_id] = i + 1  # Assign ID to ROI
+        else:
+            # Check for contours near the edges
+            for contour_data in initial_contours:
+                contour = contour_data["contour"]
+                (x, y, w, h) = cv2.boundingRect(contour)
+                if x <= 5 or y <= 5 or (x + w) >= frame.shape[1] - 5 or (y + h) >= frame.shape[0] - 5:
+                    contour_data["edge_duration"] += 1
+                else:
+                    contour_data["edge_duration"] = 0
+
+        # Create masks based on the initial contours
+        masks = []
+        for contour_data in initial_contours:
+            mask = np.zeros_like(gray)
+            ellipse = cv2.fitEllipse(contour_data["contour"])
+            cv2.ellipse(mask, ellipse, 255, -1)
+            masks.append(mask)
+
+        # Draw green circles and highlight areas where circles touch the black background
+        processed_frame = frame.copy()
+        for contour_data in initial_contours:
+            contour = contour_data["contour"]
+            edge_duration = contour_data["edge_duration"]
+            (x, y, w, h) = cv2.boundingRect(contour)
+            # Exclude contours near the edges of the frame if edge duration is less than a threshold
+            if (x > 5 and y > 5 and (x + w) < frame.shape[1] - 5 and (y + h) < frame.shape[
+                0] - 5) or edge_duration >= 90:
+                cv2.circle(processed_frame, (int(x + w / 2), int(y + h / 2)), int((w + h) / 4), (0, 255, 0), 2)
+                ellipse = cv2.fitEllipse(contour)
+                cv2.ellipse(processed_frame, ellipse, (0, 255, 0), 2)
+
+        return processed_frame, masks
+
+    def detect_flies(self, frame, masks, frame_count):
+        # Initialize blob detector parameters
         params = cv2.SimpleBlobDetector_Params()
-        params.minThreshold = 10
-        params.maxThreshold = 200
         params.filterByArea = True
-        params.minArea = 30
+        params.minArea = 10
         params.filterByCircularity = False
         params.filterByConvexity = False
         params.filterByInertia = False
 
-        ver = (cv2.__version__).split('.')
-        if int(ver[0]) < 3:
-            detector = cv2.SimpleBlobDetector(params)
-        else:
-            detector = cv2.SimpleBlobDetector_create(params)
+        # Create blob detector
+        detector = cv2.SimpleBlobDetector_create(params)
 
-        self.start_time = time.time()
+        # Define radius and thickness for drawing circles
+        radius = 6  # Increase the radius for larger dots
+        thickness = -1  # Set the thickness to a negative value for a hollow circle
 
-        while self._run_flag:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        grace_frames_threshold = int(self.fps)  # Number of frames equivalent to 1 second
 
-            current_frame += 1
-            frame_copy = frame.copy()
+        # Create a copy of the frame for drawing the pink lines
+        overlay_frame = frame.copy()
 
-            for i, roi in enumerate(self.rois):
-                roi_number = i + 1  # inside the loop over the ROIs
-                roi_center, roi_radius = roi  # Retrieve roi_center and roi_radius
-                cv2.circle(frame, roi_center, roi_radius, (0, 255, 0), 2)
-                # Add ROI number
-                text_position = (roi[0][0] - 10, roi[0][1] - roi[1] - 10)
-                cv2.putText(frame_copy, str(roi_number), text_position, cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (255, 255, 255), 2)
+        # Iterate through each mask and detect flies
+        for i, mask in enumerate(masks):
+            # Apply the mask to the frame
+            masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
 
-            # Rest of the code...
+            # Convert the masked frame to grayscale
+            gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
 
-            elapsed_time = time.time() - self.start_time
-            self.change_elapsed_time_signal.emit(self.format_time(elapsed_time))
-
-            gray = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
+            # Detect blobs (flies)
             keypoints = detector.detect(gray)
 
-            for i, roi in enumerate(self.rois):
-                roi_center, roi_radius = roi
+            # Initialize previous positions if not available
+            if i not in self.previous_positions:
+                self.previous_positions[i] = {}
 
-                blobs_in_roi = [kp for kp in keypoints if abs(kp.pt[0] - roi_center[0]) <= roi_radius and abs(
-                    kp.pt[1] - roi_center[1]) <= roi_radius]
-                blobs_in_roi.sort(key=lambda kp: kp.size, reverse=True)
-                blobs_in_roi = blobs_in_roi[:2]
-
-                color = (0, 0, 255)
-
-                if len(blobs_in_roi) == 1:
-                    now = time.time()
-                    if self.roi_flies_mating_start_time[i] is None or (
-                            self.roi_flies_last_mate_time[i] is not None and now - self.roi_flies_last_mate_time[
-                        i] < 2):
-                        self.roi_flies_mating_start_time[i] = now if self.roi_flies_mating_start_time[i] is None else \
-                            self.roi_flies_mating_start_time[i]
-                        mating_duration = now - self.roi_flies_mating_start_time[i]
-                        self.roi_flies_last_mate_time[i] = now
-
-                        if self.roi_flies_verified_mating[i]:
-                            if mating_duration > 120:
-                                color = (255, 0, 0)
-                                mating_time = self.format_time(mating_duration)
-                                mating_text = f"Mating for {mating_time} (verified mating)"
-                                self.change_text_signal.emit(i + 1, mating_text)
-                            else:
-                                color = (0, 255, 255)
-                                mating_time = self.format_time(mating_duration)
-                                self.change_text_signal.emit(i + 1, f"Mating for {mating_time}")
-                        else:
-                            if mating_duration > 120:
-                                self.roi_flies_verified_mating[i] = True
-                                color = (255, 0, 0)
-                                mating_time = self.format_time(mating_duration)
-                                mating_text = f"Mating for {mating_time} (verified mating)"
-                                self.change_text_signal.emit(i + 1, mating_text)
-                            else:
-                                color = (0, 255, 255)
-                                mating_time = self.format_time(mating_duration)
-                                self.change_text_signal.emit(i + 1, f"Mating for {mating_time}")
+            if len(keypoints) == 2:
+                # If this is the first time we've seen this ROI, initialize based on size
+                if i not in self.last_known_positions:
+                    if keypoints[0].size > keypoints[1].size:
+                        self.sex_ids[i] = ('F', 'M')
+                        self.last_known_positions[i] = {'F': keypoints[0].pt, 'M': keypoints[1].pt}
                     else:
-                        self.roi_flies_mating_start_time[i] = None
-                        self.roi_flies_last_mate_time[i] = None
-
-                    fly_size = 10  # Adjust the size as desired
-                    fly_center = (int(blobs_in_roi[0].pt[0]), int(blobs_in_roi[0].pt[1]))
-                    fly_thickness = 2  # Adjust the thickness as desired
-
-                    # Get the fly ID based on the blob ID
-                    blob_id = blobs_in_roi[0].class_id
-                    blob_data = self.blob_data[i]
-                    fly_data = self.get_fly_data(blob_id, blob_data)
-
-                    if fly_data is None:
-                        # Assign a new ID for the fly
-                        fly_id = len(self.fly_data) + 1
-                        fly_data = FlyData(fly_id, fly_center)
-                        self.fly_data.append(fly_data)
-                        blob_data.assign_fly_id(blob_id, fly_id)
-                    else:
-                        fly_data.update_position(fly_center)
-
-                    fly_label = "F" if fly_data.fly_id == 1 else "M"
-                    cv2.circle(frame, fly_center, fly_size, color, fly_thickness)
-                    cv2.putText(frame, fly_label, (fly_center[0] - 10, fly_center[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                    # Add the centroid position to the blob_data structure
-                    blob_data.blob_positions.append(fly_center)
-
+                        self.sex_ids[i] = ('M', 'F')
+                        self.last_known_positions[i] = {'F': keypoints[1].pt, 'M': keypoints[0].pt}
                 else:
-                    self.roi_flies_mating_start_time[i] = None
-                    self.roi_flies_last_mate_time[i] = None
+                    # Use last known positions to identify flies
+                    last_f_pos = self.last_known_positions[i]['F']
+                    last_m_pos = self.last_known_positions[i]['M']
 
-                    fly_size = 10  # Adjust the size as desired
-                    fly_thickness = 2  # Adjust the thickness as desired
-                    for j, kp in enumerate(blobs_in_roi):
-                        fly_center = (int(kp.pt[0]), int(kp.pt[1]))
+                    dist_to_last_f_0 = np.linalg.norm(np.array(last_f_pos) - np.array(keypoints[0].pt))
+                    dist_to_last_f_1 = np.linalg.norm(np.array(last_f_pos) - np.array(keypoints[1].pt))
 
-                        # Get the fly ID based on the blob ID
-                        blob_id = kp.class_id
-                        blob_data = self.blob_data[i]
-                        fly_data = self.get_fly_data(blob_id, blob_data)
+                    if dist_to_last_f_0 < dist_to_last_f_1:
+                        self.last_known_positions[i] = {'F': keypoints[0].pt, 'M': keypoints[1].pt}
+                        self.sex_ids[i] = ('F', 'M')
+                    else:
+                        self.last_known_positions[i] = {'F': keypoints[1].pt, 'M': keypoints[0].pt}
+                        self.sex_ids[i] = ('M', 'F')
 
-                        if fly_data is None:
-                            # Assign a new ID for the fly
-                            fly_id = len(self.fly_data) + 1
-                            fly_data = FlyData(fly_id, fly_center)
-                            self.fly_data.append(fly_data)
-                            blob_data.assign_fly_id(blob_id, fly_id)
-                        else:
-                            fly_data.update_position(fly_center)
+                # Draw gender IDs on the frame
+                cv2.putText(frame, f"{self.sex_ids.get(i, ('-', '-'))[0]} {1}",
+                            (int(keypoints[0].pt[0]), int(keypoints[0].pt[1])),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                cv2.putText(frame, f"{self.sex_ids.get(i, ('-', '-'))[1]} {2}",
+                            (int(keypoints[1].pt[0]), int(keypoints[1].pt[1])),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-                        fly_label = "F" if fly_data.fly_id == 1 else "M"
-                        cv2.circle(frame, fly_center, fly_size, color, fly_thickness)
-                        cv2.putText(frame, fly_label, (fly_center[0] - 10, fly_center[1] - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Identify the Female Fly and Store Position Data
+                if i in self.sex_ids:
+                    female_idx = self.sex_ids[i].index('F')  # Find the index of female fly
+                    x, y = int(keypoints[female_idx].pt[0]), int(keypoints[female_idx].pt[1])
 
-            self.detect_mating_events()
+                    # Store the position data
+                    if i not in self.female_fly_positions:
+                        self.female_fly_positions[i] = []
+                    self.female_fly_positions[i].append((frame_count, x, y))
 
-            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            p = convert_to_Qt_format.scaled(640, 480, Qt.KeepAspectRatio)
+                    # Store the position data for drawing the pink lines
+                    if i not in self.female_trail_data:
+                        self.female_trail_data[i] = []
+                    self.female_trail_data[i].append({'frame': frame_count, 'x': x, 'y': y})
 
-            painter = QPainter(p)
-            font = painter.font()
-            font.setPointSize(12)
-            painter.setFont(font)
+                    # Draw the trail for female flies on overlay_frame
+                    for j in range(1, len(self.female_trail_data[i])):
+                        x1, y1 = self.female_trail_data[i][j - 1]['x'], self.female_trail_data[i][j - 1]['y']
+                        x2, y2 = self.female_trail_data[i][j]['x'], self.female_trail_data[i][j]['y']
+                        cv2.line(overlay_frame, (x1, y1), (x2, y2), (203, 192, 255), 2)  # Pink line
 
-            for i, roi in enumerate(self.rois):
-                roi_center, roi_radius = roi
-                roi_label = f"ROI {i + 1}"
-                metrics = QFontMetrics(font)
-                text_width = metrics.horizontalAdvance(roi_label)
-                text_height = metrics.height()
+                    # Remove trail points that are older than 100 seconds
+                    self.female_trail_data[i] = [point for point in self.female_trail_data[i] if
+                                                 frame_count - point['frame'] <= self.fps * 10]
 
-                x = roi_center[0] - text_width // 2
-                y = roi_center[1] + roi_radius + text_height + 5
-                painter.setPen(Qt.white)
-                painter.drawText(x, y, roi_label)
+            # Draw dots on the frame for each detected fly (centroid), color depends on mating status
+            if len(keypoints) == 1:  # A mating event is occurring
+                x = int(keypoints[0].pt[0])
+                y = int(keypoints[0].pt[1])
 
-                roi_number = str(i + 1)
-                number_width = metrics.horizontalAdvance(roi_number)
-                number_x = roi_center[0] - number_width // 2
-                number_y = roi_center[1] + roi_radius + text_height + 25
-                painter.drawText(number_x, number_y, roi_number)
+                # Start timing the mating event if not already started
+                if i not in self.mating_start_frames:
+                    self.mating_start_frames[i] = frame_count
 
-            painter.end()
+                # Reset grace frames counter for this ROI
+                self.mating_grace_frames[i] = 0
 
-            self.change_pixmap_signal.emit(p)
-            cv2.waitKey(1)
+                # Calculate the duration of the mating event in frames and convert to seconds
+                mating_duration = (frame_count - self.mating_start_frames[i]) / self.fps
+                self.mating_durations.setdefault(i, []).append(mating_duration)  # Store duration in list per ROI
 
-        self.save_centroid_positions()
+                # Change dot color based on mating duration
+                if mating_duration < 360:  # Less than 1 minute
+                    cv2.circle(frame, (x, y), radius, (0, 255, 255), thickness)  # Yellow dot
+                else:  # Over 1 minute
+                    cv2.circle(frame, (x, y), radius, (255, 0, 0), thickness)  # Blue dot
 
-        cap.release()
-        cv2.destroyAllWindows()
+                    # If mating duration exceeds 60 seconds and this ROI doesn't have a verified mating start time yet
+                    if i not in self.mating_start_times:
+                        mating_time = frame_count / self.fps
+                        self.mating_start_times[i] = mating_time
+                        # Emit the verified mating start times
+                        self.verified_mating_start_times.emit(self.mating_start_times)
 
-    def stop(self):
-        self._run_flag = False
+                self.fly_info.emit(i, "Mating")
+            else:  # Mating event has potentially ended
+                # Increase grace frames counter for this ROI
+                self.mating_grace_frames[i] = self.mating_grace_frames.get(i, 0) + 1
 
-    def set_filename(self, filename):
-        self.filename = filename
+                # If grace frames counter exceeds threshold, consider the mating event to have ended
+                if self.mating_grace_frames[i] > grace_frames_threshold:
+                    if i in self.mating_start_frames:
+                        del self.mating_start_frames[i]
+                        del self.mating_grace_frames[i]
 
-    def define_roi(self, frame, min_roi_size):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.medianBlur(gray, 5)
-        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, 20, param1=50, param2=30, minRadius=0, maxRadius=0)
-        rois = []
-        if circles is not None:
-            circles = np.round(circles[0, :]).astype("int")
-            circles = sorted(circles, key=lambda x: x[0])
-            for (x, y, r) in circles:
-                if r >= min_roi_size:
-                    roi = [(x, y), r]
-                    is_overlapping = False
-                    for existing_roi in rois:
-                        existing_center, existing_radius = existing_roi
-                        dist = np.sqrt((x - existing_center[0]) ** 2 + (y - existing_center[1]) ** 2)
-                        if dist < existing_radius or dist < r:
-                            is_overlapping = True
-                            break
-                    if not is_overlapping and len(rois) < 6:
-                        rois.append(roi)
-                        self.blob_data.append(BlobData())
-        return rois
+                fly_data = []
+                pink_color = (203, 192, 255)  # BGR format for pink
+                if i not in self.last_known_positions:
+                    self.last_known_positions[i] = {}
 
-    def initialize_roi_data(self):
-        self.roi_flies_mating_start_time = [None] * len(self.rois)
-        self.roi_flies_last_mate_time = [None] * len(self.rois)
-        self.roi_flies_verified_mating = [False] * len(self.rois)
+                for idx, keypoint in enumerate(keypoints):
+                    fly_id = f'Fly_{idx + 1}'
+                    x = int(keypoint.pt[0])
+                    y = int(keypoint.pt[1])
+                    self.last_known_positions[i][fly_id] = {'x': x, 'y': y}
+                    size = keypoint.size
 
-    @staticmethod
-    def format_time(duration):
-        milliseconds = int(duration * 1000) % 1000
-        seconds = int(duration) % 60
-        minutes = int(duration // 60) % 60
-        hours = int(duration // 3600)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+                    # Draw a circle around the detected keypoint
+                    cv2.circle(frame, (x, y), 3, (0, 0, 255), -1)  # Red dot
 
-    def save_centroid_positions(self):
-        df = pd.DataFrame()
-        for i, blob_data in enumerate(self.blob_data):
-            roi_label = f"ROI {i + 1}"
-            centroids = blob_data.blob_positions
-            x_values = [centroid[0] for centroid in centroids]
-            y_values = [centroid[1] for centroid in centroids]
-            df[roi_label + "_X"] = x_values
-            df[roi_label + "_Y"] = y_values
+                    # Create a mask for this keypoint
+                    keypoint_mask = np.zeros_like(frame[:, :, 0])
+                    cv2.circle(keypoint_mask, (x, y), int(size / 2), 255, -1)
 
-        filename = "centroid_positions.xlsx"
-        df.to_excel(filename, index=False)
-        print(f"Centroid positions saved to {filename}.")
+                    # Apply pink color to the fly region
+                    # frame[keypoint_mask == 255] = pink_color
 
-    def get_fly_data(self, blob_id, blob_data):
-        for fly_data in self.fly_data:
-            if fly_data.fly_id == blob_data.fly_ids.get(blob_id):
-                return fly_data
-        return None
+                    # Store the fly data for this ROI
+                    fly_data.append({'x': x, 'y': y, 'size': size})
 
-    def detect_mating_events(self):
-        mating_distance_threshold = 4
+                self.fly_info.emit(i, fly_data)
 
-        for i, roi in enumerate(self.rois):
-            blob_data = self.blob_data[i]
-            centroids = blob_data.blob_positions
+        # Combine the original frame and the overlay
+        alpha = 0.5  # Define the alpha for blending, adjust as needed
+        cv2.addWeighted(overlay_frame, alpha, frame, 1 - alpha, 0, frame)
+        self.frame_processed.emit(frame, self.mating_durations)  # Emit the frame and the mating durations
 
-            for j, centroid1 in enumerate(centroids):
-                fly_data1 = self.get_fly_data(j + 1, blob_data)
-                if fly_data1 is None:
-                    continue
+    def generate_contour_id(self, contour):
+        return cv2.contourArea(contour)
 
-                for k, centroid2 in enumerate(centroids[j + 1:], start=j + 1):
-                    fly_data2 = self.get_fly_data(k + 1, blob_data)
-                    if fly_data2 is None:
-                        continue
-
-                    distance = np.linalg.norm(np.array(centroid1) - np.array(centroid2))
-                    if distance <= mating_distance_threshold:
-                        if not fly_data1.mating and not fly_data2.mating:
-                            fly_data1.mating = True
-                            fly_data2.mating = True
-                            fly_data1.mating_start_time = time.time()
-                            fly_data2.mating_start_time = time.time()
-                            self.change_text_signal.emit(i + 1, "Mating")
-
-                    if fly_data1.mating and time.time() - fly_data1.mating_start_time > 120:
-                        fly_data1.mating = False
-                        fly_data1.mating_start_time = None
-                        self.change_text_signal.emit(i + 1, "")
-                        if self.roi_flies_verified_mating[i]:
-                            self.roi_flies_verified_mating[i] = False
-
-                    if fly_data2.mating and time.time() - fly_data2.mating_start_time > 120:
-                        fly_data2.mating = False
-                        fly_data2.mating_start_time = None
-                        self.change_text_signal.emit(i + 1, "")
-                        if self.roi_flies_verified_mating[i]:
-                            self.roi_flies_verified_mating[i] = False
-
-class MainWindow(QWidget):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Fly Mating Detection")
-        self.resize(900, 600)
+        self.setWindowTitle("Fly Behavior Analysis")
+        self.setGeometry(200, 200, 1200, 700)
 
-        self.video_thread = VideoThread()
-        self.video_thread.change_pixmap_signal.connect(self.update_image)
-        self.video_thread.change_text_signal.connect(self.update_text)
-        self.video_thread.change_elapsed_time_signal.connect(self.update_elapsed_time)
+        self.video_path = None
+        self.initial_contours = []
 
-        self.image_label = QLabel(self)
-        self.image_label.setAlignment(Qt.AlignCenter)
+        self.video_label = QLabel(self)
+        self.video_label.setGeometry(10, 10, 780, 440)
 
-        self.text_labels = []
-        for i in range(6):
-            label = QLabel(self)
-            self.text_labels.append(label)
+        self.mating_duration_label = QLabel(self)
+        self.mating_duration_label.setGeometry(10, 360, 700, 150)
+        self.binary_image_label = QLabel(self)
+        self.binary_image_label.setGeometry(800, -30, 380, 270)  # Set the geometry as per your layout
 
-        self.start_button = QPushButton("Start")
-        self.start_button.clicked.connect(self.start_video)
+        self.frame_label = QLabel('Frame: 0', self)
+        self.frame_label.move(200, 410)
+        self.time_label = QLabel('Time (s): 0', self)
+        self.time_label.move(200, 430)
+        self.verified_mating_times_label = QLabel(self)
+        self.verified_mating_times_label.setGeometry(330, 350, 780, 120)
 
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop_video)
-        self.stop_button.setEnabled(False)
+        self.fly_info_label = QLabel(self)
+        self.fly_info_label.setGeometry(800, 130, 780, 250)
+        self.all_fly_info = {}  # Dictionary to store fly information for all ROIs
 
-        self.select_button = QPushButton("Select Video")
+        self.fps_input = QLineEdit(self)
+        self.fps_input.setGeometry(10, 630, 780, 30)
+        self.fps_input.setPlaceholderText("Enter Video FPS")
+
+        self.select_button = QPushButton("Select Video", self)
+        self.select_button.setGeometry(10, 510, 780, 30)
         self.select_button.clicked.connect(self.select_video)
 
-        self.roi_dialog = QDialog(self)
-        self.roi_dialog.setWindowTitle("Select ROIs")
-        self.roi_dialog.setLayout(QVBoxLayout())
+        self.start_button = QPushButton("Start Processing", self)
+        self.start_button.setGeometry(10, 550, 780, 30)
+        self.start_button.clicked.connect(self.start_processing)
+        self.start_button.setEnabled(False)  # The button is initially disabled
 
-        self.roi_list = QListWidget()
-        self.roi_list.setSelectionMode(QListWidget.MultiSelection)
-        self.roi_list.itemSelectionChanged.connect(self.update_roi_selection)
+        self.stop_button = QPushButton("Stop Processing", self)
+        self.processing_status_label = QLabel(self)
+        self.processing_status_label.setGeometry(10, 670, 780, 30)
+        self.stop_button.setGeometry(10, 590, 780, 30)
+        self.stop_button.clicked.connect(self.stop_processing)
+        self.stop_button.setEnabled(False)  # The button is initially disabled
 
-        self.add_roi_button = QPushButton("Add ROI")
-        self.add_roi_button.clicked.connect(self.add_roi)
+        self.video_thread = None
+        self.add_export_button()  # Add this line to create the "Export DataFrame" button
 
-        self.remove_roi_button = QPushButton("Remove ROI")
-        self.remove_roi_button.clicked.connect(self.remove_roi)
+    def add_export_button(self):
+        self.export_button = QPushButton("Export DataFrame", self)
+        self.export_button.setGeometry(10, 480, 780, 30)
+        self.export_button.clicked.connect(self.export_dataframe)
+        self.export_button.setEnabled(False)  # The button is initially disabled
 
-        self.done_roi_button = QPushButton("Done")
-        self.done_roi_button.clicked.connect(self.close_roi_dialog)
+    def enable_export_button(self):
+        self.export_button.setEnabled(True)
 
-        self.centroid_button = QPushButton("Show Centroid Position")
-        self.centroid_button.clicked.connect(self.show_centroid_position)
+    def export_dataframe(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export DataFrame to CSV", "",
+                                                   "CSV Files (*.csv);;All Files (*)")
+        if file_path:
+            mating_start_times = self.video_thread.mating_start_times
 
-        self.roi_dialog.layout().addWidget(self.roi_list)
-        self.roi_dialog.layout().addWidget(self.add_roi_button)
-        self.roi_dialog.layout().addWidget(self.remove_roi_button)
-        self.roi_dialog.layout().addWidget(self.done_roi_button)
+            # Adjust mating start times by subtracting 360 seconds
+            adjusted_mating_start_times = {roi_id: max(0, time - 360) for roi_id, time in mating_start_times.items()}
 
-        self.layout = QVBoxLayout()
-        self.layout.addWidget(self.image_label)
+            mating_times_df = pd.DataFrame(adjusted_mating_start_times.items(), columns=['ROI', 'Start Time'])
 
-        text_layout = QHBoxLayout()
-        for label in self.text_labels:
-            text_layout.addWidget(label)
-        self.layout.addLayout(text_layout)
+            # Calculate longest mating duration for each ROI from the stored lists
+            longest_mating_durations = {}
+            for roi_id, durations in self.video_thread.mating_durations.items():
+                longest_mating_durations[roi_id] = max(durations, default=0)  # Use max() with default for empty lists
 
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)
-        button_layout.addWidget(self.select_button)
-        button_layout.addWidget(self.centroid_button)
-        self.layout.addLayout(button_layout)
+            mating_times_df['Longest Duration'] = [longest_mating_durations.get(roi_id, 0) for roi_id in
+                                                   mating_times_df['ROI']]
 
-        self.setLayout(self.layout)
+            mating_times_df.to_csv(file_path, index=False)
+            self.processing_status_label.setText('DataFrame exported successfully.')
 
-    def start_video(self):
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.select_button.setEnabled(False)
-        self.centroid_button.setEnabled(True)
+    def update_verified_mating_times(self, mating_times_dict):
+        # Subtract 360 seconds from the verified mating start times
+        adjusted_mating_times_dict = {roi_id: max(0, time - 360) for roi_id, time in mating_times_dict.items()}
 
-        self.video_thread.start()
+        # Update verified mating times in the DataFrame
+        self.mating_start_times_df = pd.DataFrame(list(adjusted_mating_times_dict.items()), columns=['ROI', 'Start Time'])
+        self.mating_start_times_df['Mating Duration'] = [self.video_thread.mating_durations.get(roi_id, 0) for
+                                                         roi_id in self.mating_start_times_df['ROI']]
 
-    def stop_video(self):
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.select_button.setEnabled(True)
-        self.centroid_button.setEnabled(False)
+        # Call the method to enable the "Export DataFrame" button
+        self.enable_export_button()
 
-        self.video_thread.stop()
+        # Update verified mating times in the GUI
+        mating_time_text = "\n".join(
+            [f"ROI {roi_id}: {time:.2f} seconds" for roi_id, time in adjusted_mating_times_dict.items()])
+        self.verified_mating_times_label.setText(mating_time_text)
+
+    def update_fly_info(self, roi_id, fly_data):
+        if isinstance(fly_data, str) and fly_data == "Mating":
+            self.all_fly_info[roi_id] = "Mating"
+        else:
+            self.all_fly_info[roi_id] = fly_data
+
+        info_text = ""
+        for roi_id, flies in self.all_fly_info.items():
+            if flies == "Mating":
+                info_text += f"ROI {roi_id} - Mating\n"
+            else:
+                genders = self.video_thread.sex_ids.get(roi_id, ('-', '-'))  # Get genders for this ROI
+                for idx, (fly, gender) in enumerate(zip(flies, genders)):
+                    info_text += f"ROI {roi_id} - Fly {idx + 1} (Gender: {gender}): Size = {fly['size']:.2f}, Centroid = ({fly['x']}, {fly['y']})\n"
+
+        self.fly_info_label.setText(info_text)
 
     def select_video(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "Select Video")
-        if filename:
-            self.video_thread.set_filename(filename)
-            self.show_roi_dialog()
+        self.video_path, _ = QFileDialog.getOpenFileName(self, "Select Video")
+        self.initial_contours.clear()
+        if self.video_path:
+            # Automatically find and set the FPS
+            cap = cv2.VideoCapture(self.video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()  # Don't forget to release the VideoCapture object
+            self.fps_input.setText(str(fps))  # Set the text of the fps_input QLineEdit
+            self.start_button.setEnabled(True)  # Enable the start button
 
-    def show_roi_dialog(self):
-        self.roi_list.clear()
-        self.roi_dialog.show()
+    def update_binary_image(self, binary_image):
+        # Convert the single channel binary image to a 3-channel image
+        # This makes it compatible with QImage.Format_RGB888
+        three_channel_binary = cv2.cvtColor(binary_image, cv2.COLOR_GRAY2BGR)
 
-    def update_roi_selection(self):
-        selected_items = self.roi_list.selectedItems()
-        selected_indices = [self.roi_list.row(item) for item in selected_items]
-        self.video_thread.update_selected_rois(selected_indices)
+        height, width, channel = three_channel_binary.shape
+        bytes_per_line = 3 * width
+        q_img = QImage(three_channel_binary.data, width, height, bytes_per_line,
+                       QImage.Format.Format_RGB888).rgbSwapped()
 
-    def add_roi(self):
-        num_items = self.roi_list.count()
-        if num_items < 6:
-            self.roi_list.addItem(f"ROI {num_items + 1}")
+        pixmap = QPixmap.fromImage(q_img)
+        pixmap = pixmap.scaled(self.binary_image_label.width(), self.binary_image_label.height(),
+                               Qt.AspectRatioMode.KeepAspectRatio)
+        self.binary_image_label.setPixmap(pixmap)
 
-    def remove_roi(self):
-        selected_items = self.roi_list.selectedItems()
-        for item in selected_items:
-            self.roi_list.takeItem(self.roi_list.row(item))
+    def start_processing(self):
+        self.all_fly_info.clear()  # Clear the accumulated fly information
+        if self.video_path and self.fps_input.text():
+            self.start_button.setEnabled(False)
+            self.select_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
 
-    def close_roi_dialog(self):
-        self.roi_dialog.close()
+            fps = float(self.fps_input.text())
+            self.video_thread = VideoProcessingThread(self.video_path, self.initial_contours, fps)
+            self.video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
+            self.video_thread.binary_image_processed.connect(self.update_binary_image)
+            self.video_thread.fly_info.connect(self.update_fly_info)
+            self.video_thread.frame_info.connect(self.update_frame_info)
+            self.video_thread.frame_processed.connect(self.update_video_frame)
+            self.video_thread.finished.connect(self.processing_finished)
+            self.video_thread.start()
 
-    def show_centroid_position(self):
-        centroid_dialog = QDialog(self)
-        centroid_dialog.setWindowTitle("Centroid Positions")
-        centroid_dialog.setLayout(QVBoxLayout())
+    def stop_processing(self):
+        self.all_fly_info.clear()  # Clear the accumulated fly information
+        if self.video_thread.isRunning():
+            self.video_thread.stop()
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
+    def processing_finished(self):
+        self.processing_status_label.setText('Video processing finished.')
+        self.start_button.setEnabled(True)
+        self.select_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
-        centroid_widget = QWidget()
-        centroid_widget.setLayout(QVBoxLayout())
+    def update_video_frame(self, frame, mating_durations):
+        # Update video label
+        height, width, channel = frame.shape
+        bytes_per_line = 3 * width
+        q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).rgbSwapped()
+        pixmap = QPixmap.fromImage(q_img)
+        pixmap = pixmap.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.video_label.setPixmap(pixmap)
 
-        for i, blob_data in enumerate(self.video_thread.blob_data):
-            roi_label = f"ROI {i + 1}"
-            centroids = blob_data.blob_positions
+        # Update mating duration label with the newest duration for each ROI
+        mating_duration_text = ""
+        for roi_id, durations in mating_durations.items():
+            latest_duration = durations[-1] if durations else 0
+            mating_duration_text += f"ROI {roi_id}: {latest_duration:.2f} seconds\n"
 
-            centroid_label = QLabel(f"{roi_label} Centroid Positions:")
-            centroid_widget.layout().addWidget(centroid_label)
+        self.mating_duration_label.setText(mating_duration_text)
 
-            for j, centroid in enumerate(centroids):
-                centroid_position = QLabel(f"Centroid {j + 1}: ({centroid[0]}, {centroid[1]})")
-                centroid_widget.layout().addWidget(centroid_position)
-
-            centroid_widget.layout().addSpacing(10)
-
-        scroll_area.setWidget(centroid_widget)
-        centroid_dialog.layout().addWidget(scroll_area)
-
-        centroid_dialog.exec_()
-
-    @pyqtSlot(QImage)
-    def update_image(self, image):
-        self.image_label.setPixmap(QPixmap.fromImage(image))
-
-    @pyqtSlot(int, str)
-    def update_text(self, index, text):
-        if index >= 1 and index <= 6:
-            label = self.text_labels[index - 1]
-            label.setText(f"ROI {index}: {text}")
-
-    @pyqtSlot(str)
-    def update_elapsed_time(self, time_str):
-        roi_number = self.video_thread.roi_number  # assuming that roi_number is a property of the VideoThread class
-        self.setWindowTitle(f"Fly Mating Detection - ROI: {roi_number} - Elapsed Time: {time_str}")
-
+    def update_frame_info(self, frame, time):
+        self.frame_label.setText(f'Frame: {frame}')
+        self.time_label.setText(f'Time (s): {time:.2f}')
 
 if __name__ == "__main__":
-    import sys
-
     app = QApplication(sys.argv)
-    main_window = MainWindow()
-    main_window.show()
-    sys.exit(app.exec_())
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
