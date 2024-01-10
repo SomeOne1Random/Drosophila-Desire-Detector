@@ -15,7 +15,9 @@ This project aims to analyze the behavior of flies in a video. It specifically f
 - **Frame and Time Information**: Displays the current frame number and time in the video.
 - **Mating Event Detection**: Detects and tracks mating events, providing both the start time and duration.
 - **Binary Image Display**: Shows a thresholded (binary) version of the video for debugging purposes.
+- **Fly Center Mating Event Detection**:  Detects and tracks mating events in the center of ROI
 - **Fly Information**: Displays detailed information about each detected fly.
+- **Fly center Info**: Displays detailed information about each detected fly.
 - **Export DataFrame**: Allows the user to export data into a CSV file.
 
 ## Dependencies
