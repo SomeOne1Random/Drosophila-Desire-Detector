@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import os
+import csv
+
 
 
 class VideoProcessingThread(QThread):
@@ -18,6 +20,8 @@ class VideoProcessingThread(QThread):
     void_roi_signal = pyqtSignal(str, int)  # Signal to emit with video_path and void ROI ID
     mating_analysis_complete = pyqtSignal(str)  # Signal to indicate completion of mating analysis
     center_mating_duration_signal = pyqtSignal(int, float)  # ROI ID and duration in seconds
+    center_time_updated = pyqtSignal(int, int, int, float,
+                                     float)  # ROI ID, Male Fly ID, Female Fly ID, Male Time Center, Female Time Center
 
     def __init__(self, video_path, initial_contours, fps, skip_frames=0, perf_frame_skips=1):
         super().__init__()
@@ -46,6 +50,16 @@ class VideoProcessingThread(QThread):
         self.perf_frame_skips = perf_frame_skips
         self.roi_centers = {}
         self.center_mating_frames_count = {}  # Tracks count of center-mating frames for each ROI
+        self.center_mating_duration = {}  # Dictionary to store the longest center mating duration for each ROI
+        self.center_mating_start_frame = {}
+        self.center_mating_event_end_threshold = 3
+        self.center_time = {}  # Stores time spent in the center for each fly
+        self.roi_fly_data = {}  # Dictionary to store fly data (gender and size) for each ROI
+        self.center_start_frame = {}  # Dictionary to store start frame for each fly pair in center
+        self.roi_fly_data = {}  # Dictionary to store fly data (gender and size) for each ROI
+        self.fly_indices_per_ROI = {}  # Store male and female indices for each ROI
+        self.center_time_males = {}  # Stores time spent in the center for male flies
+        self.center_time_females = {}  # Stores time spent in the center for female flies
 
     def export_combined_mating_times(self):
         combined_mating_times = {}
@@ -68,7 +82,6 @@ class VideoProcessingThread(QThread):
                                                  combined_mating_df['ROI']]
 
         return combined_mating_df
-
 
     def run(self):
         self.is_running = True
@@ -183,7 +196,7 @@ class VideoProcessingThread(QThread):
 
             # Create mask with circle
             mask = np.zeros(processed_frame.shape[:2], dtype="uint8")
-            cv2.circle(mask, (center_x, center_y), mode_radius, 255, -1)
+            cv2.circle(mask, (center_x, center_y), mode_radius, (255,), -1)
             masks.append(mask)
 
             # Draw circle on processed frame
@@ -291,7 +304,7 @@ class VideoProcessingThread(QThread):
                         self.void_rois[i] = True
                         self.void_roi_signal.emit(self.video_path, i)  # Emit the signal
 
-                # Mating event detection and handling
+            # Mating event detection and handling
             if len(keypoints) == 1:  # A mating event is occurring
                 self.mating_event_ongoing[i] = True
 
@@ -313,6 +326,40 @@ class VideoProcessingThread(QThread):
                     # Emit the verified mating start times
                     self.verified_mating_start_times.emit(self.video_path, self.mating_start_times)
 
+                for keypoint in keypoints:
+                    x = int(keypoint.pt[0])
+                    y = int(keypoint.pt[1])
+
+                    # Calculate the distance from the fly to the center of the ROI
+                    distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
+
+                    # Determine the color based on mating status, grace frame status, and proximity to center
+                    in_center = distance_to_center <= center_threshold
+
+                    if in_center:
+                        if i not in self.center_mating_start_frame:
+                            self.center_mating_start_frame[i] = frame_count
+                        else:
+                            # Calculate the duration of the center mating event
+                            duration = frame_count - self.center_mating_start_frame[i]
+                            # Convert duration to seconds
+                            duration_in_seconds = duration / self.fps
+
+                            # Check if this is the maximum duration so far and update if necessary
+                            max_duration = self.center_mating_duration.get(i, 0)
+                            if duration_in_seconds > max_duration:
+                                self.center_mating_duration[i] = duration_in_seconds
+                                # Emit the updated duration only if it's a new maximum
+                                self.center_mating_duration_signal.emit(i, duration_in_seconds)
+                            # Emit the updated duration
+                    else:
+                        # Check if the center mating event has exceeded the threshold
+                        if i in self.center_mating_start_frame:
+                            duration_since_last_event = frame_count - self.center_mating_start_frame[i]
+                            if duration_since_last_event > self.center_mating_event_end_threshold:
+                                # Reset the start frame for the next event, instead of deleting it
+                                self.center_mating_start_frame[i] = frame_count
+
             else:  # Mating event has potentially ended
                 self.mating_event_ongoing[i] = False
                 self.mating_grace_frames[i] = self.mating_grace_frames.get(i, 0) + 1
@@ -323,6 +370,55 @@ class VideoProcessingThread(QThread):
                         del self.mating_start_frames[i]
                         del self.mating_grace_frames[i]
 
+            if len(keypoints) == 2:
+                for keypoint in keypoints:
+                    x = int(keypoint.pt[0])
+                    y = int(keypoint.pt[1])
+                    sizes = [keypoint.size for keypoint in keypoints]
+
+                    # Identify male and female based on size
+                    male_index = sizes.index(min(sizes))
+                    female_index = sizes.index(max(sizes))
+                    self.fly_indices_per_ROI[i] = (male_index, female_index)
+
+                    # Store fly data
+                    self.roi_fly_data[i] = {
+                        "male": sizes[male_index],
+                        "female": sizes[female_index]
+                    }
+
+                    # Calculate the distance from the fly to the center of the ROI
+                    distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
+                    in_center = distance_to_center <= center_threshold
+
+                    if in_center:
+                        # Check if this is the first time each fly is in the center
+                        for index, gender in zip([male_index, female_index], ['male', 'female']):
+                            fly_key = (i, index)  # Unique key for each fly
+
+                            if fly_key not in self.center_start_frame:
+                                self.center_start_frame[fly_key] = frame_count
+
+                            # Calculate the duration the fly has been in the center
+                            duration_in_center = (frame_count - self.center_start_frame[fly_key]) / self.fps
+
+                            # Accumulate the duration in separate dictionaries for males and females
+                            if gender == 'male':
+                                self.center_time_males[fly_key] = self.center_time_males.get(fly_key,
+                                                                                             0) + duration_in_center
+                            else:
+                                self.center_time_females[fly_key] = self.center_time_females.get(fly_key,
+                                                                                                 0) + duration_in_center
+
+                            # Emit the signal with the updated cumulative center time for each gender
+                            self.center_time_updated.emit(i, male_index, female_index,
+                                                          self.center_time_males.get(fly_key, 0),
+                                                          self.center_time_females.get(fly_key, 0))
+                    else:
+                        # Reset the start frame for the next visit
+                        self.center_start_frame.pop((i, male_index), None)
+                        self.center_start_frame.pop((i, female_index), None)
+
             # Draw dots on the frame for each detected fly (centroid)
             for keypoint in keypoints:
                 x = int(keypoint.pt[0])
@@ -331,10 +427,11 @@ class VideoProcessingThread(QThread):
                 # Calculate the distance from the fly to the center of the ROI
                 distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
 
-                # Determine the color based on mating status, grace frame status, and proximity to center
-                in_center = distance_to_center <= center_threshold
                 mating_ongoing = self.mating_event_ongoing.get(i, False)
                 within_grace_period = self.mating_grace_frames.get(i, 0) <= grace_frames_threshold
+
+                # Determine the color based on mating status, grace frame status, and proximity to center
+                in_center = distance_to_center <= center_threshold
 
                 if mating_ongoing or within_grace_period:
                     mating_duration = self.mating_durations.get(i, [0])[-1]  # Get the latest duration
@@ -349,22 +446,6 @@ class VideoProcessingThread(QThread):
                 # Change color if the fly is in the center
                 if in_center:
                     color = (0, 255, 0)  # Green color for flies in the center
-
-                    if in_center and mating_ongoing:
-                        # Use the mating duration for this ROI
-                        mating_duration = self.mating_durations.get(i, [0])[-1]
-
-                        # Check if there is a start time for mating
-                        if i in self.mating_start_frames:
-                            # Calculate the duration since the mating event started
-                            duration_since_start = (frame_count - self.mating_start_frames[i]) / self.fps
-                            mating_duration = min(mating_duration, duration_since_start)
-
-                        # Update the duration in the dictionary
-                        self.center_mating_frames_count[i] = mating_duration
-
-                        # Emit the updated duration
-                        self.center_mating_duration_signal.emit(i, mating_duration)
 
                 cv2.circle(frame_with_padding, (x, y), radius, color, thickness)
 
@@ -395,9 +476,12 @@ class MainWindow(QMainWindow):
         self.latest_frames = {}  # Stores the latest frame for each video
         self.latest_mating_durations = {}  # Stores the latest mating durations for each video
         self.mating_start_times_dfs = {}  # Dictionary to store mating start times for each video
+        self.center_time_label = QLabel()  # Label to display center times
+
+
+        self.auto_export_directory = "path_to_export_directory"  # Set a default directory for auto-export
         # Organize UI elements
         self.init_ui()
-        self.auto_export_directory = "path_to_export_directory"  # Set a default directory for auto-export
 
 
     def init_ui(self):
@@ -582,6 +666,17 @@ class MainWindow(QMainWindow):
 
         self.center_mating_duration_layout.addWidget(self.scroll_area_for_center_mating_duration)
 
+        # Add a group box for displaying center time information for all ROIs
+        self.center_time_group = QGroupBox("Center Time Information", self)
+        self.center_time_group.setGeometry(890, 600, 300, 200)  # Adjust size and position
+
+        center_time_layout = QVBoxLayout()
+
+        self.center_time_list = QListWidget()  # Using QListWidget to display information
+        center_time_layout.addWidget(self.center_time_list)
+
+        self.center_time_group.setLayout(center_time_layout)
+
     # Handle errors or other information that needs to be shown to the user
     def show_error(self, message):
         QMessageBox.critical(self, "Error", message)
@@ -657,48 +752,27 @@ class MainWindow(QMainWindow):
         self.center_mating_duration_labels[roi_id].setText(
             f"ROI {roi_id}: Center Mating Duration: {duration:.2f} seconds")
 
-    def auto_export_dataframe(self, video_path):
-        # Retrieve the corresponding video thread
-        video_thread = self.video_threads.get(video_path)
-        if video_thread:
-            # Generate the default export name based on the video file name
-            default_export_name = os.path.splitext(video_path)[0] + '_analysis.csv'
+    def update_center_time(self, roi_id, male_index, female_index, male_time_in_center, female_time_in_center):
+        # Create unique keys for male and female flies in the same ROI
+        male_key = f"ROI {roi_id} - Male Fly {male_index}"
+        female_key = f"ROI {roi_id} - Female Fly {female_index}"
 
-            # Prepare data for export
-            data = []
-            num_rois = len(video_thread.initial_contours)
-            for roi in range(num_rois):
-                start_time = video_thread.mating_start_times.get(roi, 'N/A')
-                start_time = 'N/A' if start_time == 'N/A' else max(0, start_time - 360)
+        # Find existing items for both male and female flies in the QListWidget
+        existing_items = [self.center_time_list.item(i) for i in range(self.center_time_list.count())]
+        male_existing_item = next((item for item in existing_items if item.text().startswith(male_key)), None)
+        female_existing_item = next((item for item in existing_items if item.text().startswith(female_key)), None)
 
-                durations = video_thread.mating_durations.get(roi, [])
-                longest_duration = max(durations, default=0)
-                # Calculate center mating duration in seconds
-                center_mating_frames = video_thread.center_mating_frames_count.get(roi, 0)
-                center_mating_duration = center_mating_frames
-                longest_duration = 0 if longest_duration < 360 else longest_duration
+        # Update or create item for male fly
+        if male_existing_item:
+            male_existing_item.setText(f"{male_key}: {male_time_in_center:.2f} seconds in center")
+        else:
+            self.center_time_list.addItem(f"{male_key}: {male_time_in_center:.2f} seconds in center")
 
-                # Mating status is true if the most recent mating event lasted at least 360 seconds
-                mating_status = durations[-1] >= 360 if durations else False
-
-                data.append({'ROI': roi, 'Adjusted Start Time': start_time,
-                             'Longest Duration': longest_duration,
-                             'Mating Status': mating_status, 'Center-Mating Duration': center_mating_duration}
-                            )
-
-            # Create DataFrame
-            mating_times_df = pd.DataFrame(data)
-
-            # Mark void ROIs as 'N/A'
-            void_rois = video_thread.void_rois
-            for column in ['Adjusted Start Time', 'Longest Duration', 'Mating Status']:
-                mating_times_df[column] = mating_times_df.apply(
-                    lambda row: 'N/A' if void_rois.get(row['ROI'], False) else row[column], axis=1)
-
-            # Export to CSV
-            mating_times_df.to_csv(default_export_name, index=False)
-            self.processing_status_label.setText(f'DataFrame for {video_path} exported successfully.')
-            QMessageBox.information(self, "Success", f"DataFrame for {video_path} exported successfully.")
+        # Update or create item for female fly
+        if female_existing_item:
+            female_existing_item.setText(f"{female_key}: {female_time_in_center:.2f} seconds in center")
+        else:
+            self.center_time_list.addItem(f"{female_key}: {female_time_in_center:.2f} seconds in center")
 
     def export_dataframe(self):
         for video_path, video_thread in self.video_threads.items():
@@ -715,24 +789,46 @@ class MainWindow(QMainWindow):
 
                     durations = video_thread.mating_durations.get(roi, [])
                     longest_duration = max(durations, default=0)
-                    # Calculate center mating duration in seconds
-                    center_mating_frames = video_thread.center_mating_frames_count.get(roi, 0)
-                    center_mating_duration = center_mating_frames
-                    longest_duration = 0 if longest_duration < 360 else longest_duration
-
-                    # Mating status is true if the most recent mating event lasted at least 360 seconds
                     mating_status = durations[-1] >= 360 if durations else False
+                    center_mating_duration = video_thread.center_mating_duration.get(roi, 0)
 
-                    data.append({'ROI': roi, 'Adjusted Start Time': start_time,
-                                 'Longest Duration': longest_duration,
-                                 'Mating Status': mating_status, 'Center-Mating Duration': center_mating_duration})
+                    # Use the data from update_center_time
+                    male_key = f"ROI {roi} - Male Fly"
+                    female_key = f"ROI {roi} - Female Fly"
+
+                    male_time_in_center = 0
+                    female_time_in_center = 0
+
+                    # Find existing items for both male and female flies in the QListWidget
+                    existing_items = [self.center_time_list.item(i) for i in range(self.center_time_list.count())]
+                    male_existing_item = next((item for item in existing_items if item.text().startswith(male_key)),
+                                              None)
+                    female_existing_item = next((item for item in existing_items if item.text().startswith(female_key)),
+                                                None)
+
+                    if male_existing_item:
+                        male_time_in_center = float(male_existing_item.text().split(': ')[1].split(' seconds')[0])
+
+                    if female_existing_item:
+                        female_time_in_center = float(female_existing_item.text().split(': ')[1].split(' seconds')[0])
+
+                    data.append({
+                        'ROI': roi,
+                        'Adjusted Start Time': start_time,
+                        'Longest Duration': longest_duration,
+                        'Mating Status': mating_status,
+                        'Longest Center-Mating Duration': center_mating_duration,
+                        'Male Time in Center': male_time_in_center,
+                        'Female Time in Center': female_time_in_center,
+                        'Outside Center Mating Duration': longest_duration - center_mating_duration
+                    })
 
                 # Create DataFrame
                 mating_times_df = pd.DataFrame(data)
 
                 # Mark void ROIs as 'N/A'
                 void_rois = video_thread.void_rois
-                for column in ['Adjusted Start Time', 'Longest Duration', 'Mating Status']:
+                for column in mating_times_df.columns:
                     mating_times_df[column] = mating_times_df.apply(
                         lambda row: 'N/A' if void_rois.get(row['ROI'], False) else row[column], axis=1)
 
@@ -814,9 +910,10 @@ class MainWindow(QMainWindow):
                     video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
                     self.video_threads[video_path] = video_thread
                     # Connect signals
-                    video_thread.mating_analysis_complete.connect(self.auto_export_dataframe)
+                    video_thread.mating_analysis_complete.connect(self.export_dataframe)
                     video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
                     video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
+                    video_thread.center_time_updated.connect(self.update_center_time)
                     video_thread.frame_info.connect(self.update_frame_info)
                     video_thread.frame_processed.connect(self.update_video_frame)
                     video_thread.frame_processed.connect(self.update_video_frame)
