@@ -527,7 +527,7 @@ class MainWindow(QMainWindow):
 
         # Set up the main window attributes
         self.setWindowTitle("Fly Behavior Analysis")
-        self.setGeometry(200, 200, 1200, 1400)  # Adjust size as needed
+        self.setGeometry(200, 200, 1500, 1400)  # Adjust size as needed
 
         # Paths and initial setups
         self.video_path = None
@@ -539,6 +539,8 @@ class MainWindow(QMainWindow):
         self.latest_mating_durations = {}  # Stores the latest mating durations for each video
         self.mating_start_times_dfs = {}  # Dictionary to store mating start times for each video
         self.center_gender_duration_labels = {}
+        self.video_queue = []
+
 
         # Organize UI elements
         self.init_ui()
@@ -743,7 +745,159 @@ class MainWindow(QMainWindow):
 
         self.center_gender_duration_layout.addWidget(self.scroll_area_for_center_gender_duration)
 
-    # Handle errors or other information that needs to be shown to the user
+        video_queue_group = QGroupBox("Video Queue", self)
+        video_queue_group.setGeometry(1200, 40, 300, 180)  # Adjust the position and size as needed
+
+        queue_layout = QVBoxLayout()
+
+        # Button to add videos to the queue
+        self.add_to_queue_button = QPushButton("Add Videos to Queue")
+        self.add_to_queue_button.clicked.connect(self.add_videos_to_queue)
+        queue_layout.addWidget(self.add_to_queue_button)
+
+        # Button to clear the queue
+        self.clear_queue_button = QPushButton("Clear Queue")
+        self.clear_queue_button.clicked.connect(self.clear_video_queue)
+        queue_layout.addWidget(self.clear_queue_button)
+
+        # List widget to display queued videos
+        self.video_queue_list_widget = QListWidget()
+        queue_layout.addWidget(self.video_queue_list_widget)
+
+        video_queue_group.setLayout(queue_layout)
+
+        self.start_queue_button = QPushButton("Start Processing Queue", self)
+        self.start_queue_button.clicked.connect(self.start_processing_queue)
+        self.start_queue_button.setGeometry(1200, 230, 300, 30)  # Adjust geometry as needed
+
+    def add_videos_to_queue(self):
+        video_paths, _ = QFileDialog.getOpenFileNames(self, "Select Videos to Add to Queue")
+        for video_path in video_paths:
+            if video_path not in self.video_queue:
+                self.set_fps_from_video(video_path)
+                self.video_queue.append(video_path)
+                self.video_queue_list_widget.addItem(video_path.split("/")[-1])
+    def clear_video_queue(self):
+        # Clear the video queue and update the list widget
+        self.video_queue.clear()
+        self.video_queue_list_widget.clear()
+        self.processing_status_label.setText('Video queue cleared.')
+        # Optionally, you might want to disable the start processing queue button if the queue is empty
+        self.start_queue_button.setEnabled(False)
+
+    def start_processing_queue(self):
+        if not self.video_queue:
+            self.show_error("The video queue is empty.")
+            return
+
+        if self.fps_input.text():
+            self.start_button.setEnabled(False)
+            self.select_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.processing_status_label.setText('Starting to process the video queue...')
+            first_video_path = self.video_queue.pop(0)
+            self.start_processing_video(first_video_path)
+        else:
+            self.show_error("FPS value is required to process the queue.")
+
+    def start_processing_next_video(self):
+        if self.video_queue:
+            video_path = self.video_queue.pop(0)  # Get and remove the first video from the queue
+            fps = float(self.fps_input.text())
+            skip_seconds = float(self.skip_frames_input.text()) if self.skip_frames_input.text() else 0
+            skip_frames = int(skip_seconds * fps)
+            try:
+                perf_frame_skips = int(self.frame_skip_input.text())
+            except ValueError:
+                perf_frame_skips = 100  # Default value if input is invalid
+
+            video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
+            self.video_threads[video_path] = video_thread
+            self.connect_video_thread_signals(video_thread)
+            video_thread.mating_analysis_complete.connect(self.export_dataframe)
+            video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
+            video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
+            video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
+            video_thread.frame_info.connect(self.update_frame_info)
+            video_thread.frame_processed.connect(self.update_video_frame)
+            video_thread.frame_processed.connect(self.update_video_frame)
+            video_thread.finished.connect(self.processing_finished)
+            video_thread.void_roi_signal.connect(self.void_roi_handler)
+            video_thread.start()
+
+            video_thread.start()
+        else:
+            self.processing_status_label.setText('No more videos to process.')
+            self.start_button.setEnabled(True)
+            self.select_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
+    def start_processing_video(self, video_path):
+        # Get the frames per second (FPS) value from the input field
+        fps = float(self.fps_input.text())
+
+        # Get the number of seconds to skip from the input field and convert it to frames
+        skip_seconds = float(self.skip_frames_input.text()) if self.skip_frames_input.text() else 0
+        skip_frames = int(skip_seconds * fps)
+
+        # Get the number of frames to skip for performance (if provided)
+        try:
+            perf_frame_skips = int(self.frame_skip_input.text())
+        except ValueError:
+            perf_frame_skips = 100  # Default value if input is invalid
+
+        # Initialize the video processing thread with the provided video path and settings
+        video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
+
+        # Store the thread in a dictionary to keep track of it
+        self.video_threads[video_path] = video_thread
+
+        # Connect the finished signal to the method that handles queue processing
+        video_thread.finished.connect(self.process_next_video_in_queue)
+
+        # Connect other necessary signals
+        video_thread.frame_processed.connect(self.update_video_frame)
+        video_thread.frame_info.connect(self.update_frame_info)
+        video_thread.mating_analysis_complete.connect(self.export_dataframe)
+        video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
+        video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
+        video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
+        video_thread.void_roi_signal.connect(self.void_roi_handler)
+
+        # Start the video processing thread
+        video_thread.start()
+
+    def processing_finished(self):
+        # Check if there are more videos to process
+        if self.video_queue:
+            self.start_processing_next_video()  # Start processing the next video in the queue
+        else:
+            self.processing_status_label.setText('Video queue processing completed.')
+            self.start_button.setEnabled(True)
+            self.select_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
+    def connect_video_thread_signals(self, video_thread):
+        # Connect all necessary signals from video_thread to respective slots
+        video_thread.mating_analysis_complete.connect(self.export_dataframe)
+        video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
+        video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
+        video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
+        video_thread.frame_info.connect(self.update_frame_info)
+        video_thread.frame_processed.connect(self.update_video_frame)
+        video_thread.finished.connect(self.processing_finished)
+        video_thread.void_roi_signal.connect(self.void_roi_handler)
+
+    def process_next_video_in_queue(self):
+        if self.video_queue:
+            next_video_path = self.video_queue.pop(0)
+            self.start_processing_video(next_video_path)
+        else:
+            self.processing_status_label.setText('Video queue processing completed.')
+            self.start_button.setEnabled(True)
+            self.select_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
     def show_error(self, message):
         QMessageBox.critical(self, "Error", message)
 
@@ -842,7 +996,8 @@ class MainWindow(QMainWindow):
                 f"ROI {roi_id} (female): Center Gender Duration: {female_duration:.2f} seconds")
 
     def export_dataframe(self):
-        for video_path, video_thread in self.video_threads.items():
+        video_threads_items = list(self.video_threads.items())
+        for video_path, video_thread in video_threads_items:
             if video_thread:
                 # Generate the default export name based on the video file name
                 default_export_name = os.path.splitext(video_path)[0] + '_analysis.csv'
@@ -891,7 +1046,7 @@ class MainWindow(QMainWindow):
                 # Export to CSV
                 mating_times_df.to_csv(default_export_name, index=False)
                 self.processing_status_label.setText(f'DataFrame for {video_path} exported successfully.')
-                QMessageBox.information(self, "Success", f"DataFrame for {video_path} exported successfully.")
+                # QMessageBox.information(self, "Success", f"DataFrame for {video_path} exported successfully.")
 
     def previous_video(self):
         if self.current_video_index > 0:
@@ -912,21 +1067,40 @@ class MainWindow(QMainWindow):
                 self.update_video_frame(current_video_path, frame, mating_durations)
 
     def update_verified_mating_times(self, video_path, mating_times_dict):
-        if video_path in self.video_threads and hasattr(self.video_threads[video_path], 'mating_durations'):
-            adjusted_mating_times_dict = {roi_id: max(0, time - 360) for roi_id, time in mating_times_dict.items()}
-            mating_times_df = pd.DataFrame(list(adjusted_mating_times_dict.items()), columns=['ROI', 'Start Time'])
+        # Check if there are videos in the list
+        if not self.video_paths:
+            print("There are no videos in the list.")
+            return
 
+        # Ensure the current video index is within the bounds
+        if not 0 <= self.current_video_index < len(self.video_paths):
+            print("Current video index is out of range.")
+            return
+
+        # Get the path of the current video
+        current_video_path = self.video_paths[self.current_video_index]
+
+        # Check if the video path corresponds to the current video
+        if video_path != current_video_path:
+            print("The video path does not match the current video.")
+            return
+
+        # Process the mating times for the current video
+        adjusted_mating_times_dict = {roi_id: max(0, time - 360) for roi_id, time in mating_times_dict.items()}
+        mating_times_df = pd.DataFrame(list(adjusted_mating_times_dict.items()), columns=['ROI', 'Start Time'])
+
+        # Calculate mating durations and adjust the mating times
+        if video_path in self.video_threads and hasattr(self.video_threads[video_path], 'mating_durations'):
             durations = self.video_threads[video_path].mating_durations
             mating_times_df['Mating Duration'] = [durations.get(roi_id, 0) for roi_id in mating_times_df['ROI']]
 
+            # Store the DataFrame for the current video
             self.mating_start_times_dfs[video_path] = mating_times_df
 
-            current_video_path = self.video_paths[self.current_video_index]
-            if video_path == current_video_path:  # Only update the GUI if the video_path matches the current video
-                self.enable_export_button()
-                mating_time_text = "\n".join(
-                    [f"ROI {roi_id}: {time:.2f} seconds" for roi_id, time in adjusted_mating_times_dict.items()])
-                self.verified_mating_times_label.setText(mating_time_text)
+            # Update the GUI with the new mating times
+            mating_time_text = "\n".join(
+                [f"ROI {row['ROI']}: {row['Start Time']:.2f} seconds" for _, row in mating_times_df.iterrows()])
+            self.verified_mating_times_label.setText(mating_time_text)
         else:
             print("Error: video_thread for the current video is None or doesn't have the required attributes")
 
@@ -1000,33 +1174,34 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
 
     def update_video_frame(self, video_path, frame, mating_durations):
-        # Check if the frame is from the current video being displayed
-        current_video_path = self.video_paths[self.current_video_index]
-        if video_path == current_video_path:
-            # Update video_label
-            height, width, channel = frame.shape
-            bytes_per_line = 3 * width
-            q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).rgbSwapped()
-            pixmap = QPixmap.fromImage(q_img)
-            pixmap = pixmap.scaled(self.video_label.width(), self.video_label.height(),
-                                   Qt.AspectRatioMode.KeepAspectRatio)
-            self.video_label.setPixmap(pixmap)
+        # Ensure that the current video index is within the valid range
+        if 0 <= self.current_video_index < len(self.video_paths):
+            current_video_path = self.video_paths[self.current_video_index]
+            if video_path == current_video_path:
+                # Update video_label
+                height, width, channel = frame.shape
+                bytes_per_line = 3 * width
+                q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).rgbSwapped()
+                pixmap = QPixmap.fromImage(q_img)
+                pixmap = pixmap.scaled(self.video_label.width(), self.video_label.height(),
+                                       Qt.AspectRatioMode.KeepAspectRatio)
+                self.video_label.setPixmap(pixmap)
 
-            # Update mating_duration_label with the newest duration for each ROI
-            mating_duration_text = ""
-            for roi_id, durations in mating_durations.items():
-                latest_duration = durations[-1] if durations else 0
-                mating_duration_text += f"ROI {roi_id}: {latest_duration:.2f} seconds\n"
-            self.mating_duration_label.setText(mating_duration_text)
+                # Update mating_duration_label with the newest duration for each ROI
+                mating_duration_text = ""
+                for roi_id, durations in mating_durations.items():
+                    latest_duration = durations[-1] if durations else 0
+                    mating_duration_text += f"ROI {roi_id}: {latest_duration:.2f} seconds\n"
+                self.mating_duration_label.setText(mating_duration_text)
 
-            # Display mating start times for the current video
-            if video_path in self.mating_start_times_dfs:
-                mating_times_df = self.mating_start_times_dfs[video_path]
-                mating_time_text = "\n".join(
-                    [f"ROI {row['ROI']}: {row['Start Time']:.2f} seconds" for _, row in mating_times_df.iterrows()])
-                self.verified_mating_times_label.setText(mating_time_text)
-            else:
-                self.verified_mating_times_label.setText("")
+                # Display mating start times for the current video
+                if video_path in self.mating_start_times_dfs:
+                    mating_times_df = self.mating_start_times_dfs[video_path]
+                    mating_time_text = "\n".join(
+                        [f"ROI {row['ROI']}: {row['Start Time']:.2f} seconds" for _, row in mating_times_df.iterrows()])
+                    self.verified_mating_times_label.setText(mating_time_text)
+                else:
+                    self.verified_mating_times_label.setText("")
 
         # Store the frame and mating durations for this video
         self.latest_frames[video_path] = frame
