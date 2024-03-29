@@ -54,7 +54,7 @@ class VideoProcessingThread(QThread):
         self.fly_position_history = {}
         self.fly_trail_history = {}
         self.center_gender_duration = {}  # Initialize the dictionary to store center duration for each gender
-
+        self.pre_mating_center_gender_duration = {}  # Initialize the dictionary to store pre-mating center duration for each gender
 
     def export_combined_mating_times(self):
         combined_mating_times = {}
@@ -381,36 +381,16 @@ class VideoProcessingThread(QThread):
                             self.fly_trail_history[i] = []
                             self.mating_event_ongoing[i] = False
 
-                # Track center mating duration
-                x, y = int(keypoints[0].pt[0]), int(keypoints[0].pt[1])
-                distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
-                in_center = distance_to_center <= center_threshold
-
-                if in_center:
-                    if i not in self.center_mating_start_frame:
-                        self.center_mating_start_frame[i] = frame_count
-                    else:
-                        # Calculate the duration of the center mating event
-                        center_duration = (frame_count - self.center_mating_start_frame[i]) / self.fps
-
-                        if mating_duration >= 360:
-                            self.center_mating_duration.setdefault(i, []).append(center_duration)
-
-                        # Update the start frame for the next center mating event
-                        self.center_mating_start_frame[i] = frame_count
-                else:
-                    if i in self.center_mating_start_frame:
-                        # Check if the center mating event has exceeded the threshold
-                        duration_since_last_event = (frame_count - self.center_mating_start_frame[i]) / self.fps
-                        if duration_since_last_event > self.center_mating_event_end_threshold:
-                            # Reset the start frame for the next event
-                            self.center_mating_start_frame[i] = frame_count
-                            self.fly_trail_history[i] = []
-                            self.mating_event_ongoing[i] = False
 
             else:  # Mating event has potentially ended
                 self.mating_event_ongoing[i] = False
                 self.mating_grace_frames[i] = self.mating_grace_frames.get(i, 0) + 1
+
+                if i in self.mating_start_frames:
+                    mating_duration = (frame_count - self.mating_start_frames[i]) / self.fps
+                    # Check the duration of the mating event and delete center mating durations if necessary
+                    if mating_duration < 360 and i in self.center_mating_duration:
+                        del self.center_mating_duration[i]
 
                 # If grace frames counter exceeds threshold, consider the mating event to have ended
                 if self.mating_grace_frames[i] > grace_frames_threshold:
@@ -467,6 +447,15 @@ class VideoProcessingThread(QThread):
                     x, y = int(fly.pt[0]), int(fly.pt[1])
                     distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
                     in_center = distance_to_center <= center_threshold
+
+                    # Initialize the nested dictionary if necessary
+                    if i not in self.pre_mating_center_gender_duration:
+                        self.pre_mating_center_gender_duration[i] = {'male': 0, 'female': 0}
+
+                    if not self.mating_event_ongoing.get(i, False) and in_center:
+                        if all(duration < 360 for duration in self.mating_durations.get(i, [])):
+                            self.pre_mating_center_gender_duration[i][
+                                gender] += 1 / self.fps  # Convert frame count to seconds
 
                     # Initialize the nested dictionary if necessary
                     if i not in self.center_gender_duration:
@@ -800,38 +789,6 @@ class MainWindow(QMainWindow):
         else:
             self.show_error("FPS value is required to process the queue.")
 
-    def start_processing_next_video(self):
-        if self.video_queue:
-            video_path = self.video_queue.pop(0)  # Get and remove the first video from the queue
-            fps = float(self.fps_input.text())
-            skip_seconds = float(self.skip_frames_input.text()) if self.skip_frames_input.text() else 0
-            skip_frames = int(skip_seconds * fps)
-            try:
-                perf_frame_skips = int(self.frame_skip_input.text())
-            except ValueError:
-                perf_frame_skips = 100  # Default value if input is invalid
-
-            video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
-            self.video_threads[video_path] = video_thread
-            self.connect_video_thread_signals(video_thread)
-            video_thread.mating_analysis_complete.connect(self.export_dataframe)
-            video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
-            video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
-            video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
-            video_thread.frame_info.connect(self.update_frame_info)
-            video_thread.frame_processed.connect(self.update_video_frame)
-            video_thread.frame_processed.connect(self.update_video_frame)
-            video_thread.finished.connect(self.processing_finished)
-            video_thread.void_roi_signal.connect(self.void_roi_handler)
-            video_thread.start()
-
-            video_thread.start()
-        else:
-            self.processing_status_label.setText('No more videos to process.')
-            self.start_button.setEnabled(True)
-            self.select_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-
     def start_processing_video(self, video_path):
         # Get the frames per second (FPS) value from the input field
         fps = float(self.fps_input.text())
@@ -866,27 +823,6 @@ class MainWindow(QMainWindow):
 
         # Start the video processing thread
         video_thread.start()
-
-    def processing_finished(self):
-        # Check if there are more videos to process
-        if self.video_queue:
-            self.start_processing_next_video()  # Start processing the next video in the queue
-        else:
-            self.processing_status_label.setText('Video queue processing completed.')
-            self.start_button.setEnabled(True)
-            self.select_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-
-    def connect_video_thread_signals(self, video_thread):
-        # Connect all necessary signals from video_thread to respective slots
-        video_thread.mating_analysis_complete.connect(self.export_dataframe)
-        video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
-        video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
-        video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
-        video_thread.frame_info.connect(self.update_frame_info)
-        video_thread.frame_processed.connect(self.update_video_frame)
-        video_thread.finished.connect(self.processing_finished)
-        video_thread.void_roi_signal.connect(self.void_roi_handler)
 
     def process_next_video_in_queue(self):
         if self.video_queue:
@@ -1019,20 +955,42 @@ class MainWindow(QMainWindow):
 
                     center_mating_durations = video_thread.center_mating_duration.get(roi, [])
                     total_center_mating_duration = sum(center_mating_durations)
+                    if total_center_mating_duration > 15:
+                        total_center_mating_duration -= 15
 
                     # Calculate outside center mating duration
                     outside_center_mating_duration = max(0, longest_duration - total_center_mating_duration)
+
+                    center_male_duration = video_thread.center_gender_duration.get(roi, {}).get('male', 0)
+                    center_female_duration = video_thread.center_gender_duration.get(roi, {}).get('female', 0)
+
+                    pre_mating_male_duration = video_thread.pre_mating_center_gender_duration.get(roi, {}).get('male',
+                                                                                                               0)
+                    pre_mating_female_duration = video_thread.pre_mating_center_gender_duration.get(roi, {}).get(
+                        'female', 0)
+
+                    post_mating_male_duration = center_male_duration - pre_mating_male_duration
+                    post_mating_female_duration = center_female_duration - pre_mating_female_duration
+
+                    non_mating_center_duration = (center_male_duration + center_female_duration) / 2
 
                     # Get the center gender durations
                     center_male_duration = video_thread.center_gender_duration.get(roi, {}).get('male', 0)
                     center_female_duration = video_thread.center_gender_duration.get(roi, {}).get('female', 0)
 
-                    data.append({'ROI': roi, 'Adjusted Start Time': start_time,
+                    data.append({'ROI': roi,
+                                 'Adjusted Start Time': start_time,
                                  'Longest Duration': longest_duration,
-                                 'Mating Status': mating_status, 'Center-Mating Duration': total_center_mating_duration,
+                                 'Mating Status': mating_status,
+                                 'Center-Mating Duration': total_center_mating_duration,
                                  'Male Time in Center': center_male_duration,
-                                 'Female Time in Center': center_female_duration, 'Outside Center Mating Duration':
-                                     outside_center_mating_duration})
+                                 'Female Time in Center': center_female_duration,
+                                 'Average Non Mating':non_mating_center_duration,
+                                 'Outside Center Mating Duration':outside_center_mating_duration,
+                                 'Pre-mating Male Center Duration': pre_mating_male_duration,
+                                 'Post-mating Male Center Duration': post_mating_male_duration,
+                                 'Pre-mating Female Center Duration': pre_mating_female_duration,
+                                 'Post-mating Female Center Duration': post_mating_female_duration})
 
                 # Create DataFrame
                 mating_times_df = pd.DataFrame(data)
@@ -1046,7 +1004,7 @@ class MainWindow(QMainWindow):
                 # Export to CSV
                 mating_times_df.to_csv(default_export_name, index=False)
                 self.processing_status_label.setText(f'DataFrame for {video_path} exported successfully.')
-                # QMessageBox.information(self, "Success", f"DataFrame for {video_path} exported successfully.")
+                print(f"Success: DataFrame for {video_path} exported successfully.")
 
     def previous_video(self):
         if self.current_video_index > 0:
