@@ -516,7 +516,7 @@ class MainWindow(QMainWindow):
 
         # Set up the main window attributes
         self.setWindowTitle("Fly Behavior Analysis")
-        self.setGeometry(200, 200, 1500, 1400)  # Adjust size as needed
+        self.setGeometry(200, 200, 1700, 1400)  # Adjust size as needed
 
         # Paths and initial setups
         self.video_path = None
@@ -735,7 +735,7 @@ class MainWindow(QMainWindow):
         self.center_gender_duration_layout.addWidget(self.scroll_area_for_center_gender_duration)
 
         video_queue_group = QGroupBox("Video Queue", self)
-        video_queue_group.setGeometry(1200, 40, 300, 180)  # Adjust the position and size as needed
+        video_queue_group.setGeometry(1200, 40, 300, 400)  # Adjust the position and size as needed
 
         queue_layout = QVBoxLayout()
 
@@ -757,15 +757,20 @@ class MainWindow(QMainWindow):
 
         self.start_queue_button = QPushButton("Start Processing Queue", self)
         self.start_queue_button.clicked.connect(self.start_processing_queue)
-        self.start_queue_button.setGeometry(1200, 230, 300, 30)  # Adjust geometry as needed
+        self.start_queue_button.setGeometry(1200, 440, 300, 30)  # Adjust geometry as needed
 
     def add_videos_to_queue(self):
-        video_paths, _ = QFileDialog.getOpenFileNames(self, "Select Videos to Add to Queue")
-        for video_path in video_paths:
-            if video_path not in self.video_queue:
-                self.set_fps_from_video(video_path)
-                self.video_queue.append(video_path)
-                self.video_queue_list_widget.addItem(video_path.split("/")[-1])
+        directory = QFileDialog.getExistingDirectory(self, "Select Directory with AVI Files")
+        if directory:
+            # Scan for AVI files within the selected directory
+            for filename in os.listdir(directory):
+                if filename.endswith(".avi"):
+                    video_path = os.path.join(directory, filename)
+                    if video_path not in self.video_queue:
+                        self.set_fps_from_video(video_path)
+                        self.video_queue.append(video_path)
+                        self.video_queue_list_widget.addItem(filename)
+
     def clear_video_queue(self):
         # Clear the video queue and update the list widget
         self.video_queue.clear()
@@ -801,7 +806,7 @@ class MainWindow(QMainWindow):
         try:
             perf_frame_skips = int(self.frame_skip_input.text())
         except ValueError:
-            perf_frame_skips = 100  # Default value if input is invalid
+            perf_frame_skips = 1  # Default value if input is invalid
 
         # Initialize the video processing thread with the provided video path and settings
         video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
