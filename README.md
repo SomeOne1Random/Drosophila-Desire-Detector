@@ -1,7 +1,3 @@
-Certainly! Below is a sample README.md file that you could use to describe this project on GitHub.
-
----
-
 # Fly Behavior Analysis
 
 ## Overview
